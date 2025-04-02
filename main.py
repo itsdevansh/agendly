@@ -1,5 +1,20 @@
-import streamlit as st
 import os
+import json
+import streamlit as st
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from datetime import datetime, timedelta, timezone
+import pytz
+import re
+import chromadb
+from langchain_ollama import ChatOllama
+from event_handler import get_events
+import tempfile
+from openai import OpenAI
+import queue
+import sounddevice as sd
+import scipy.io.wavfile as wav
+import numpy as np
 from PIL import Image
 import io
 from chatbot_with_todo import get_workflow, run_chatbot
@@ -10,18 +25,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from streamlit_extras.stylable_container import stylable_container
-import sounddevice as sd
-import scipy.io.wavfile as wav
-import numpy as np
-import tempfile
-from openai import OpenAI
-import queue
-from langchain_ollama import ChatOllama
-from event_handler import get_events
-import datetime
-import re
-import chromadb
-
+from event_handler import create_event, get_events, init_google_calendar, edit_todo, delete_event
 TOKEN_FILE = "token.json"
 CLIENT_SECRET_FILE = "credentials.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -83,6 +87,21 @@ def speak_text(text):
     response = response.read()
     st.audio(response, format="audio/wav", autoplay=True)
 
+def init_model() -> ChatOpenAI:
+    try:
+        MODEL_NAME = os.getenv("MODEL_NAME")
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        llm = ChatOpenAI(
+            model=MODEL_NAME,
+            temperature=0.3,
+            api_key=OPENAI_API_KEY,
+        )
+        print("Model initialized successfully:", llm)
+        return llm
+    except Exception as e:
+        print(f"Model cannot be initialized: {e}")
+
+llm = init_model()
 
 TODO_FILE = "todos.json"
 
@@ -96,9 +115,110 @@ def save_todos(todos):
     with open(TODO_FILE, "w") as f:
         json.dump(todos, f, indent=2)
 
+def schedule_todos(todos, events, energy_level):
+    try:
+        # Get today's date and time in PST
+        pst = pytz.timezone('America/Los_Angeles')
+        now = datetime.now(pst)
+        today_str = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
 
+        # Format existing events for context
+        events_context = "Today's existing events:\n"
+        for event in events:
+            start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00')).astimezone(pst)
+            end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00')).astimezone(pst)
+            events_context += f"- {event['summary']}: {start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')}\n"
 
+        # Format todos for context
+        todos_context = "Tasks to schedule:\n"
+        for todo in todos:
+            todos_context += f"- {todo}\n"
 
+        # Add energy level context
+        energy_context = f"\nCurrent energy level: {energy_level}/10"
+        if energy_level <= 3:
+            energy_context += " (Low energy - prefer shorter, easier tasks)"
+        elif energy_level <= 6:
+            energy_context += " (Medium energy - moderate task complexity ok)"
+        else:
+            energy_context += " (High energy - can handle challenging tasks)"
+
+        prompt = f"""
+You are an intelligent task scheduler that helps users with ADHD manage their time effectively.
+Current date: {today_str}
+Current time: {current_time}
+
+{events_context}
+{todos_context}
+{energy_context}
+
+Your task is to:
+1. Analyze today's existing events and available time slots
+2. Consider the user's current energy level when scheduling tasks
+3. For each todo item:
+   - Estimate reasonable duration (20-45 minutes for most tasks)
+   - Find suitable time slot that doesn't conflict with existing events
+   - Consider task complexity and user's energy level
+   - Add 15-minute buffer time between tasks for breaks
+4. Create calendar events for each task using the create_event tool
+
+Rules:
+- Only schedule for today ({today_str})
+- Respect existing events - no overlaps
+- Include 15-minute breaks between tasks
+- Start scheduling after current time ({current_time})
+- Use ISO 8601 format for dates/times with timezone
+- Set location as empty string
+- Set description as "Scheduled from todo list"
+- No attendees needed
+- End times must be after start times
+"""
+
+        # Create messages list for the agent
+        messages = [
+            HumanMessage(content=prompt)
+        ]
+
+        # Create React agent with calendar tools
+        agent = create_react_agent(
+            llm,
+            tools=[create_event, get_events],
+            state_modifier=prompt
+        )
+
+        # Invoke agent
+        result = agent.invoke({"messages": messages})
+        
+        # Extract the response content
+        if isinstance(result, dict) and 'messages' in result:
+            response_content = result['messages'][-1].content
+        else:
+            response_content = str(result)
+
+        # Create a formatted JSON response
+        formatted_response = {
+            "message": "Scheduling completed successfully",
+            "needs_deep_analysis": False,
+            "scheduling_context": {
+                "date": today_str,
+                "time": current_time,
+                "energy_level": energy_level
+            },
+            "response_for_user": response_content
+        }
+
+        return json.dumps(formatted_response)
+
+    except Exception as e:
+        print(f"Error in schedule_todos: {e}")
+        error_response = {
+            "message": "Error scheduling todos",
+            "needs_deep_analysis": False,
+            "scheduling_context": {},
+            "response_for_user": f"Failed to schedule todos: {str(e)}"
+        }
+        return json.dumps(error_response)
 
 def initialize_session_state():
     if "messages" not in st.session_state:
@@ -124,7 +244,7 @@ def initialize_session_state():
     if "todos" not in st.session_state:
         st.session_state.todos = load_todos()
 
-def process_message(message, creds) -> str:
+def process_message(message, creds, energy_level=5) -> str:
     # Initialize ChromaDB client
     client = chromadb.PersistentClient(path="./chroma_db_persistent")
     collection = client.get_collection("pdf_semantic_chunks")
@@ -141,14 +261,26 @@ def process_message(message, creds) -> str:
         context_chunks = results['documents'][0]  # Get documents from first query
     context_text = "\n\n".join(context_chunks)
     
+    # Create energy level context
+    energy_context = f"\nUser's current energy level is {energy_level}/10. "
+    if energy_level <= 3:
+        energy_context += "Please suggest smaller, more manageable tasks and be extra supportive."
+    elif energy_level <= 6:
+        energy_context += "Consider breaking down complex tasks into medium-sized chunks."
+    else:
+        energy_context += "User has good energy, can handle more challenging tasks."
+
     if st.session_state.state.values == {}:
-        # Include the retrieved context in the message
+        # Include both the retrieved context and energy level in the message
         enhanced_message = f"""User Query: {message}
 
 Relevant Context from Knowledge Base:
 {context_text}
 
-Please consider the above context while responding to the user query."""
+Energy Context:
+{energy_context}
+
+Please consider both the above context and user's energy level while responding to the query."""
         
         st.session_state.state.values["messages"] = [HumanMessage(enhanced_message)]
     else:
@@ -157,7 +289,10 @@ Please consider the above context while responding to the user query."""
 Relevant Context from Knowledge Base:
 {context_text}
 
-Please consider the above context while responding to the user query."""
+Energy Context:
+{energy_context}
+
+Please consider both the above context and user's energy level while responding to the query."""
         st.session_state.state.values["messages"].append(HumanMessage(enhanced_message))
     
     updated_state = run_chatbot(st.session_state.graph, st.session_state.state.values, creds)
@@ -174,10 +309,10 @@ def process_overwhelmed(message, creds) -> str:
     from event_handler import init_google_calendar
     init_google_calendar(creds)
     
-    # Get the current UTC time and one day ahead in RFC3339 format
-    now = datetime.datetime.now(datetime.UTC)
+    # Get the current UTC time and one day ahead
+    now = datetime.now(timezone.utc)
     startDateTime = now.isoformat()
-    endDateTime = (now + datetime.timedelta(days=1)).isoformat()
+    endDateTime = (now + timedelta(days=1)).isoformat()
     
     # Retrieve upcoming events from the calendar
     try:
@@ -217,9 +352,9 @@ def process_with_gemma(message, creds) -> str:
     init_google_calendar(creds)
 
     # Get upcoming events for the next 24 hours
-    now = datetime.datetime.now(datetime.UTC)
+    now = datetime.now(timezone.utc)
     startDateTime = now.isoformat()
-    endDateTime = (now + datetime.timedelta(days=1)).isoformat()
+    endDateTime = (now + timedelta(days=1)).isoformat()
 
     try:
         events = get_events.invoke({
@@ -355,7 +490,7 @@ def main():
         st.error(f"Initialization error: {str(e)}")
         return
     
-    st.title("📅 Calendar Assistant")
+    st.title("Executive Fuinction Assistant")
     if not st.session_state.authenticated:
         st.markdown("""
             <div class="welcome-container">
@@ -371,6 +506,17 @@ def main():
     if st.session_state.authenticated:
         st.markdown("### 💡 Assistant Settings")
         feeling_toggle = st.toggle("Feeling Overwhelmed")
+        
+        # Add energy level slider in the sidebar
+        with st.sidebar:
+            st.markdown("### 🔋 Energy Level")
+            energy_level = st.slider(
+                "Current Energy Level",
+                min_value=1,
+                max_value=10,
+                value=5,
+                help="1 = Very low energy, 10 = Very high energy"
+            )
         
         if feeling_toggle:
             st.session_state.using_gemma = True
@@ -404,50 +550,80 @@ def main():
                     from event_handler import init_google_calendar
                     init_google_calendar(st.session_state.creds)
                     
-                    today_start = datetime.datetime.now(datetime.UTC).replace(
+                    today_start = datetime.now(timezone.utc).replace(
                         hour=0, minute=0, second=0, microsecond=0
                     )
-                    today_end = today_start + datetime.timedelta(days=1)
+                    today_end = today_start + timedelta(days=1)
                     
                     try:
-                        events = get_events.invoke({
+                        events_response = get_events.invoke({
                             "startDateTime": today_start.isoformat(),
                             "endDateTime": today_end.isoformat()
                         })
                         
-                        if events and len(events) > 0:
+                        # Directly use the events list if it's already in the expected format
+                        if isinstance(events_response, list):
+                            events = events_response
+                        elif isinstance(events_response, dict):
+                            # Handle the dictionary case as before
+                            if 'data' in events_response and 'items' in events_response['data']:
+                                events = events_response['data']['items']
+                            elif 'items' in events_response:
+                                events = events_response['items']
+                            else:
+                                events = []
+                        else:
+                            events = []
+                        
+                        if events:
                             for event in events:
-                                start_time = datetime.datetime.fromisoformat(
-                                    event['start']['dateTime']
-                                ).strftime("%I:%M %p")
-                                end_time = datetime.datetime.fromisoformat(
-                                    event['end']['dateTime']
-                                ).strftime("%I:%M %p")
-                                
-                                st.markdown(
-                                    f"**{event['summary']}**\n"
-                                    f"🕒 {start_time} - {end_time}"
-                                )
+                                col1, col2 = st.columns([8, 2])
+                                with col1:
+                                    # Extract start and end times from the event
+                                    start = event.get('start', {}).get('dateTime')
+                                    end = event.get('end', {}).get('dateTime')
+                                    
+                                    if start and end:
+                                        start_time = datetime.fromisoformat(start).strftime("%I:%M %p")
+                                        end_time = datetime.fromisoformat(end).strftime("%I:%M %p")
+                                        
+                                        st.markdown(
+                                            f"**{event.get('summary', 'Untitled Event')}**\n"
+                                            f"🕒 {start_time} - {end_time}"
+                                        )
+                                with col2:
+                                    if st.button("❌", key=f"delete_event_{event.get('eventId')}"):
+                                        try:
+                                            delete_event.invoke({"eventId": event.get('eventId')})
+                                            st.success("Event deleted!")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Failed to delete event: {str(e)}")
                                 st.divider()
                         else:
                             st.info("No events scheduled for today")
                     except Exception as e:
                         st.error(f"Could not fetch events: {str(e)}")
-                else:
-                    st.warning("Please authenticate to view calendar events")
+                        print(f"Events fetch error details: {e}")  # For debugging
                 
                 # Todo List Section
                 st.markdown("### 📝 Your To-Do List")
                 todos = st.session_state.todos
                 updated_todos = []
+
                 for i, todo in enumerate(todos):
                     col1, col2 = st.columns([8, 2])
                     with col1:
                         edited = st.text_input(f"todo_{i}", todo, key=f"todo_input_{i}")
-                        updated_todos.append(edited)
                     with col2:
                         if st.button("❌", key=f"delete_{i}"):
+                            # Skip this todo by not adding it to updated_todos
                             continue
+                        else:
+                            # Only add todos that weren't deleted
+                            updated_todos.append(edited)
+
+                # Update session state and save to file
                 st.session_state.todos = updated_todos
                 save_todos(updated_todos)
 
@@ -460,7 +636,47 @@ def main():
                         save_todos(st.session_state.todos)
                         st.rerun()
 
-                save_todos(st.session_state.todos)
+                # Schedule Todo button
+                st.markdown("### 📋 Task Scheduling")
+                if st.button("🗓️ Schedule Todos", use_container_width=True):
+                    if not st.session_state.todos:
+                        st.warning("No todos to schedule!")
+                    else:
+                        with st.spinner("Scheduling todos..."):
+                            try:
+                                # Get current events
+                                today_start = datetime.now(timezone.utc).replace(
+                                    hour=0, minute=0, second=0, microsecond=0
+                                )
+                                today_end = today_start + timedelta(days=1)
+                                
+                                events = get_events.invoke({
+                                    "startDateTime": today_start.isoformat(),
+                                    "endDateTime": today_end.isoformat()
+                                })
+                                
+                                # Get energy level (assuming it's defined somewhere)
+                                energy_level = 5  # Default value if not set elsewhere
+                                
+                                # Schedule todos
+                                result = schedule_todos(
+                                    st.session_state.todos, 
+                                    events,
+                                    energy_level
+                                )
+                                
+                                schedule_result = json.loads(result)
+                                st.success("Tasks scheduled successfully!")
+                                st.markdown(schedule_result["response_for_user"])
+                                
+                                # Clear todos after successful scheduling
+                                st.session_state.todos = []
+                                save_todos([])
+                                st.rerun()
+                                
+                            except Exception as e:
+                                st.error(f"Failed to schedule todos: {str(e)}")
+                                print(f"Scheduling error details: {e}")
             col1, col2 = st.columns([1, 10])
             with col1:
                 if st.button(icon=st.session_state.recording_icon, label="", key="mic", type='primary'):
@@ -530,7 +746,11 @@ def main():
                 else:
                     # Process normally using the default chatbot workflow
                     with st.chat_message("assistant"):
-                        response = json.loads(process_message(text, st.session_state.creds))['response_for_user']
+                        response = json.loads(process_message(
+                            text, 
+                            st.session_state.creds,
+                            energy_level=energy_level  # Pass the energy level
+                        ))['response_for_user']
                         if audio:
                             speak_text(response)
                         st.markdown(response)
