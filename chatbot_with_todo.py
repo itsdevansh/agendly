@@ -54,53 +54,70 @@ llm = init_model()
 def calendar_agent(state: MessagesState) -> MessagesState:
     try:
         user_message = state["messages"][-1].content
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        current_time = datetime.now().strftime("%H:%M:%S")
-        
-        # Check if message is a todo list addition
-        if user_message.lower().startswith("add") and "to the todo list" in user_message.lower():
-            # Extract the todo item between "add" and "to the todo list"
-            todo_item = user_message[3:].lower().split("to the todo list")[0].strip()
-            if todo_item:
-                updated_todos = edit_todo(todo_item)
-                response = {
-                    "message": f"Added '{todo_item}' to todo list",
-                    "needs_deep_analysis": False,
-                    "scheduling_context": {},
-                    "response_for_user": f"✅ Added to your todo list: {todo_item}"
-                }
-                result = {"messages": [AIMessage(content=json.dumps(response))]}
-                result["messages"][-1] = HumanMessage(content=result["messages"][-1].content, name="calendar")
-                state["messages"].extend(result["messages"])
-                return state
-       
-        # Original calendar handling prompt for other cases
+        toronto_tz = pytz.timezone('America/Toronto')
+        now = datetime.now(toronto_tz)
+        today_str = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
+
+        # First fetch today's events and todos
+        today_start = f"{today_str}T00:00:00-04:00"  # Toronto timezone offset
+        today_end = f"{today_str}T23:59:59-04:00"
+        try:
+            today_events = get_events.invoke({
+                "startDateTime": today_start,
+                "endDateTime": today_end
+            })
+            events_context = "\nToday's events:\n" + "\n".join([
+                f"- {event['summary']}: {event['start']['dateTime']} to {event['end']['dateTime']}"
+                for event in today_events.get('items', [])
+            ])
+        except Exception as e:
+            events_context = f"\nNo events found for today ({today_str} Toronto time)."
+            
+        try:
+            with open("todos.json", "r") as f:
+                todos = json.load(f)
+            todos_context = "\nCurrent todos:\n" + "\n".join([f"- {todo}" for todo in todos])
+        except (FileNotFoundError, json.JSONDecodeError):
+            todos_context = "\nNo existing todos."
+# 3. If the user provides a todo list for scheduling:
+#    - Parse and extract each task
+#    - If times aren't specified, set needs_deep_analysis to True
+#    - If times are specified, create events with:
+#      * summary: task description
+#      * location: empty string
+#      * description: "Scheduled from to-do list"
+#      * start_time and end_time in ISO 8601 format
+#      * no attendees
+
         prompt = f"""
-You are an intelligent assistant that manages a Google Calendar.
-You can call only one tool at a time, once you create one event you have to call again if you want to create another event.
-While updating or deletiang events, get all the events for the mentioned date from 12am to 11:59pm. Use the id of that particular event to perform the necessary action.
-output date/time values in ISO 8601/RFC3339 format including the time zone information.
-If the user says Add to to do list, you have to call the edit_todo tool to add the task to the to do list.
-If the user has provided a to-do list. Your task is to:
-  1. Parse the following to-do list input and extract each task.
-  2. Fetch the events of the mentioned day using get_event tool as prescribed from 12am to 11:59pm.
-  3. If you do not have times for each task set the boolean needs_deep_analysis as True for scheduling tasks and return the output in the mentioned format. There exists an agent that will provide you with the times for each events. You can create events only after that. 
-  4. If you do have times, set the boolean needs_deep_analysis as False and move to the next step.
-  5. For each scheduled task, call the tool "create_event" with these parameters:
-     - summary: the task description.
-     - location: an empty string if not provided.
-     - description: "Scheduled from to-do list".
-     - start_time: the scheduled start time.
-     - end_time: the scheduled end time.
-     - attendees: an empty list.
+You are an intelligent assistant that manages a Google Calendar and todo lists.
+{events_context}
+{todos_context}
+
+Your task is to process the user's request appropriately:
+
+1. If the user wants to add items to the todo list:
+   - Use the edit_todo tool to add the tasks
+   - Return a response confirming the addition
+
+2. If the user wants to schedule events or manage calendar:
+   - For calendar queries: Use get_events to fetch relevant events
+   - For creating events: Use create_event (one at a time)
+   - For updating/deleting: Use update_event/delete_event with the event ID
+   
+
 User input: "{user_message}"
-Today's date is {today_str}.
-current time is {current_time}.
-Output must only be a valid JSON in the following format with no extra characters:
-            - message: Message for the agent.
-            - needs_deep_analysis: Boolean indicating need for deeper scheduling help if the user asks to schedule a task or gives a todo list. Once you have all the details the next time you call set this to False.
-            - scheduling_context: Additional metadata with user input.
-            - response_for_user: Response to the user for user input with all information (if any) formatted in a pretty way if needs_deep_analysis is False, else empty.
+Today's date: {today_str}
+Current time: {current_time}
+
+Output must be a valid JSON with this structure:
+{{
+    "message": "Message describing the action taken",
+    "needs_deep_analysis": False,
+    "scheduling_context": {{ "tasks": [] }},
+    "response_for_user": "User-friendly response (empty if needs_deep_analysis is true)"
+}}
 """
         graph_agent = create_react_agent(
             llm,
@@ -108,43 +125,82 @@ Output must only be a valid JSON in the following format with no extra character
             state_modifier=prompt
         )
         result = graph_agent.invoke(state)
-        print("Final state:", result['messages'][-1].content)
-        result["messages"][-1] = HumanMessage(content=result["messages"][-1].content, name="calendar")
+        
+        # Ensure the response is proper JSON
+        try:
+            response_content = json.loads(result['messages'][-1].content)
+        except json.JSONDecodeError:
+            response_content = {
+                "message": result['messages'][-1].content,
+                "needs_deep_analysis": False,
+                "scheduling_context": {},
+                "response_for_user": result['messages'][-1].content
+            }
+        
+        result["messages"][-1] = HumanMessage(content=json.dumps(response_content), name="calendar")
         state["messages"].extend(result["messages"])
         return state
 
     except Exception as e:
         print(f"Error in calendar_agent: {e}")
+        # Return a valid JSON response even in case of error
+        error_response = {
+            "message": f"Error: {str(e)}",
+            "needs_deep_analysis": False,
+            "scheduling_context": {},
+            "response_for_user": "I encountered an error processing your request."
+        }
+        state["messages"].append(HumanMessage(content=json.dumps(error_response), name="calendar"))
         return state
     
 
 def scheduling_agent(state: MessagesState) -> MessagesState:
     try:
-      
         agent_message = state["messages"][-1].content
         date = datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
         
+        # Ensure we're working with parsed JSON
+        try:
+            parsed_message = json.loads(agent_message)
+        except json.JSONDecodeError:
+            parsed_message = {"scheduling_context": {}, "message": agent_message}
+
         prompt = f"""
-        You are an intellient task scheduling that schedules user's tasks or events at reasonable times by analysing user's schedule for the day. You need to think how much time will each task take and what order should to schedule the tasks in.
+        You are an intelligent task scheduling that schedules user's tasks or events at reasonable times by analysing user's schedule for the day. You need to think how much time will each task take and what order should to schedule the tasks in.
         Remember that today's date and time {date}. Schedule events only after the current time without overlap with existing events.
-        Your input: {agent_message}
+        Your input: {json.dumps(parsed_message)}
         output date/time values in ISO 8601/RFC3339 format including the time zone information.
         Output all user's tasks with the scheduled start time and end time and all other information you received. Respond only in valid json format.
         """
     
         deepseek = ChatOllama(model='deepseek-r1:8b')
-        print("----------------------------", deepseek)
-
         graph_agent = create_react_agent(model=deepseek, tools=[], state_modifier=prompt)
         result = graph_agent.invoke(state)
-        print("Scheduling agent result:", result)  # Debugging
-        result["messages"][-1] = HumanMessage(content=result["messages"][-1].content.split('</think>')[1], name="calendar")
-        state["messages"].extend(result["messages"])
         
+        # Ensure the response is proper JSON
+        try:
+            response_content = json.loads(result['messages'][-1].content.split('</think>')[-1])
+        except json.JSONDecodeError:
+            response_content = {
+                "message": "Scheduled tasks",
+                "needs_deep_analysis": False,
+                "scheduling_context": {},
+                "response_for_user": result['messages'][-1].content
+            }
+        
+        result["messages"][-1] = HumanMessage(content=json.dumps(response_content), name="calendar")
+        state["messages"].extend(result["messages"])
         return state
     
     except Exception as e:
         print(f"Error in scheduling_agent: {e}")
+        error_response = {
+            "message": f"Error: {str(e)}",
+            "needs_deep_analysis": False,
+            "scheduling_context": {},
+            "response_for_user": "I encountered an error while scheduling tasks."
+        }
+        state["messages"].append(HumanMessage(content=json.dumps(error_response), name="calendar"))
         return state
 
 # ------------------------------------------------------------------------------

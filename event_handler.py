@@ -68,8 +68,8 @@ def create_event(
             "summary": summary,
             "location": location,
             "description": description,
-            "start": {"dateTime": start_time, "timeZone": "America/Los_Angeles"},
-            "end": {"dateTime": end_time, "timeZone": "America/Los_Angeles"},
+            "start": {"dateTime": start_time, "timeZone": "America/Toronto"},
+            "end": {"dateTime": end_time, "timeZone": "America/Toronto"},
             "recurrence": ["RRULE:FREQ=DAILY;COUNT=1"],
             "attendees": [{"email": attendee} for attendee in attendees],
             "reminders": {
@@ -93,8 +93,8 @@ def create_event(
 def get_events(startDateTime: str, endDateTime: str) -> List[dict]:
   """Get Google Calendar events using any date range.
   Args:
-    startDateTime (str): The start time of the event. example : 2011-06-03T10:00:00-07:00
-    endDateTime (str): The end time of the event. example : 2011-06-03T14:00:00-07:00
+    startDateTime (str): The start time of the event. example : 2011-06-03T10:00:00-04:00
+    endDateTime (str): The end time of the event. example : 2011-06-03T14:00:00-04:00
   
   Returns:
     dict: The Google Calendar events with event Id
@@ -181,11 +181,17 @@ def edit_todo(todos: Union[str, List[str]]) -> List[str]:
         List[str]: The updated list of todos
     """
     try:
+        # Ensure the TODO_FILE exists with proper initial content
+        if not os.path.exists(TODO_FILE):
+            with open(TODO_FILE, "w") as f:
+                json.dump([], f)
+        
         # Read existing todos
         try:
             with open(TODO_FILE, "r") as f:
-                existing_todos = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+                content = f.read().strip()
+                existing_todos = json.loads(content) if content else []
+        except (json.JSONDecodeError, FileNotFoundError):
             existing_todos = []
             
         # Convert input to list if it's a single string
@@ -194,13 +200,22 @@ def edit_todo(todos: Union[str, List[str]]) -> List[str]:
         # Add new todos
         existing_todos.extend(new_todos)
         
-        # Save updated todos
+        # Save updated todos with proper formatting
         with open(TODO_FILE, "w") as f:
             json.dump(existing_todos, f, indent=2)
+            
+        # Update Streamlit session state if available
+        try:
+            import streamlit as st
+            if 'todos' in st.session_state:
+                st.session_state.todos = existing_todos
+                st.rerun()
+        except ImportError:
+            pass
             
         print(f"Added {len(new_todos)} todo(s) successfully")
         return existing_todos
         
-    except Exception as error:
-        print(f"An error occurred while editing todos: {error}")
+    except Exception as e:
+        print(f"Error in edit_todo: {e}")
         return []

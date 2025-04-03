@@ -25,6 +25,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from streamlit_extras.stylable_container import stylable_container
+from streamlit_autorefresh import st_autorefresh
 from event_handler import create_event, get_events, init_google_calendar, edit_todo, delete_event
 TOKEN_FILE = "token.json"
 CLIENT_SECRET_FILE = "credentials.json"
@@ -77,15 +78,32 @@ def transcribe_audio(audio_file_path):
     return transcription.text
 
 def speak_text(text):
-    client = OpenAI()
-    speech_file_path = "speech.mp3"
-    response = client.audio.speech.create(
-        model="tts-1",
-        voice="nova",
-        input=text,
-    )
-    response = response.read()
-    st.audio(response, format="audio/wav", autoplay=True)
+    """
+    Convert text to speech using OpenAI's TTS API
+    """
+    try:
+        client = OpenAI()
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="nova",
+            input=text,
+        )
+        
+        # Create a temporary file to store the audio
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+            # Write the audio content to the temporary file
+            response.stream_to_file(tmp_file.name)
+            
+            # Play the audio using streamlit
+            with open(tmp_file.name, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+            
+            # Clean up the temporary file
+            os.unlink(tmp_file.name)
+    except Exception as e:
+        print(f"Error in text-to-speech: {e}")
+        st.error("Failed to generate speech")
 
 def init_model() -> ChatOpenAI:
     try:
@@ -117,18 +135,18 @@ def save_todos(todos):
 
 def schedule_todos(todos, events, energy_level):
     try:
-        # Get today's date and time in PST
-        pst = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(pst)
+        # Get today's date and time in Toronto timezone
+        toronto_tz = pytz.timezone('America/Toronto')
+        now = datetime.now(toronto_tz)
         today_str = now.strftime("%Y-%m-%d")
         current_time = now.strftime("%H:%M:%S")
 
         # Format existing events for context
         events_context = "Today's existing events:\n"
         for event in events:
-            start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00')).astimezone(pst)
-            end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00')).astimezone(pst)
-            events_context += f"- {event['summary']}: {start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')}\n"
+            start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00')).astimezone(toronto_tz)
+            end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00')).astimezone(toronto_tz)
+            events_context += f"- {event['summary']}: {start.strftime('%I:%M %p %Z')} - {end.strftime('%I:%M %p %Z')}\n"
 
         # Format todos for context
         todos_context = "Tasks to schedule:\n"
@@ -145,7 +163,7 @@ def schedule_todos(todos, events, energy_level):
             energy_context += " (High energy - can handle challenging tasks)"
 
         prompt = f"""
-You are an intelligent task scheduler that helps users with ADHD manage their time effectively.
+You are an intelligent task scheduler that helps users with Executive functional difficulties manage their time effectively.
 Current date: {today_str}
 Current time: {current_time}
 
@@ -158,14 +176,15 @@ Your task is to:
 2. Consider the user's current energy level when scheduling tasks
 3. For each todo item:
    - Estimate reasonable duration (20-45 minutes for most tasks)
-   - Find suitable time slot that doesn't conflict with existing events
+   - Find suitable time slot that doesn't conflict with existing events else penalty
    - Consider task complexity and user's energy level
    - Add 15-minute buffer time between tasks for breaks
 4. Create calendar events for each task using the create_event tool
 
 Rules:
 - Only schedule for today ({today_str})
-- Respect existing events - no overlaps
+- Respect existing events - no overlaps else penalty
+- Analyze and see when what tasks makes sense with respect to other tasks and events.
 - Include 15-minute breaks between tasks
 - Start scheduling after current time ({current_time})
 - Use ISO 8601 format for dates/times with timezone
@@ -243,6 +262,112 @@ def initialize_session_state():
         st.session_state.using_gemma = False
     if "todos" not in st.session_state:
         st.session_state.todos = load_todos()
+    if "timer_end_time" not in st.session_state:
+        st.session_state.timer_end_time = None
+    if "timer_duration" not in st.session_state:
+        st.session_state.timer_duration = None
+    if "timer_paused" not in st.session_state:
+        st.session_state.timer_paused = False
+    if "pause_time" not in st.session_state:
+        st.session_state.pause_time = None
+    if "time_remaining" not in st.session_state:
+        st.session_state.time_remaining = None
+
+def start_timer(minutes):
+    st.session_state.timer_duration = minutes
+    st.session_state.timer_end_time = datetime.now() + timedelta(minutes=minutes)
+    st.session_state.timer_paused = False
+    st.session_state.pause_time = None
+
+def pause_timer():
+    if st.session_state.timer_end_time and not st.session_state.timer_paused:
+        st.session_state.timer_paused = True
+        st.session_state.pause_time = datetime.now()
+        st.session_state.time_remaining = st.session_state.timer_end_time - datetime.now()
+
+def resume_timer():
+    if st.session_state.timer_paused and st.session_state.pause_time:
+        st.session_state.timer_paused = False
+        st.session_state.timer_end_time = datetime.now() + st.session_state.time_remaining
+
+def stop_timer():
+    st.session_state.timer_end_time = None
+    st.session_state.timer_duration = None
+    st.session_state.timer_paused = False
+    st.session_state.pause_time = None
+    st.session_state.time_remaining = None
+
+def display_timer():
+    st.markdown("### ⏲️ Timer")
+    
+    # Timer input and start button
+    if not st.session_state.timer_end_time:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            minutes = st.number_input("Minutes", min_value=1, max_value=60, value=25, step=1)
+        with col2:
+            if st.button("Start", use_container_width=True, type="primary"):
+                start_timer(minutes)
+                st.rerun()
+    
+    # Active timer display
+    if st.session_state.timer_end_time:
+        if not st.session_state.timer_paused:
+            time_remaining = st.session_state.timer_end_time - datetime.now()
+            
+            # Rerun every second while timer is active
+            if time_remaining.total_seconds() > 0:
+                time.sleep(1)  # Wait for 1 second
+                st.rerun()
+        else:
+            time_remaining = st.session_state.time_remaining
+            
+        if time_remaining.total_seconds() <= 0:
+            st.success(f"⏰ Timer completed!")
+            stop_timer()
+            st.rerun()
+            return
+            
+        minutes_remaining = int(time_remaining.total_seconds() // 60)
+        seconds_remaining = int(time_remaining.total_seconds() % 60)
+        
+        # Timer display
+        st.markdown(f"""
+        <div style='text-align: center; 
+                    padding: 20px; 
+                    background-color: #1E1E1E; 
+                    border-radius: 10px; 
+                    margin: 10px 0;
+                    border: 1px solid #333333;'>
+            <h1 style='margin: 0; color: #FFFFFF; font-size: 48px;'>
+                {minutes_remaining:02d}:{seconds_remaining:02d}
+            </h1>
+            <p style='margin: 10px 0 0 0; color: #888888;'>
+                {st.session_state.timer_duration} minute timer
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Timer controls
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.session_state.timer_paused:
+                if st.button("▶️ Resume", use_container_width=True):
+                    resume_timer()
+                    st.rerun()
+            else:
+                if st.button("⏸️ Pause", use_container_width=True):
+                    pause_timer()
+                    st.rerun()
+        with col2:
+            if st.button("⏹️ Stop", use_container_width=True):
+                stop_timer()
+                st.rerun()
+        with col3:
+            if st.button("🔄 Reset", use_container_width=True):
+                stop_timer()
+                start_timer(st.session_state.timer_duration)
+                st.rerun()
 
 def process_message(message, creds, energy_level=5) -> str:
     # Initialize ChromaDB client
@@ -298,6 +423,7 @@ Please consider both the above context and user's energy level while responding 
     updated_state = run_chatbot(st.session_state.graph, st.session_state.state.values, creds)
     st.session_state.state.values['messages'].append(updated_state.values["messages"][-1])
     response = st.session_state.state.values["messages"][-1].content
+    # print("Response from chatbot:", response)
     return response
 
 def process_overwhelmed(message, creds) -> str:
@@ -309,12 +435,12 @@ def process_overwhelmed(message, creds) -> str:
     from event_handler import init_google_calendar
     init_google_calendar(creds)
     
-    # Get the current UTC time and one day ahead
-    now = datetime.now(timezone.utc)
+    # Get the current time in Toronto timezone
+    toronto_tz = pytz.timezone('America/Toronto')
+    now = datetime.now(toronto_tz)
     startDateTime = now.isoformat()
     endDateTime = (now + timedelta(days=1)).isoformat()
     
-    # Retrieve upcoming events from the calendar
     try:
         events = get_events.invoke({
             "startDateTime": startDateTime,
@@ -324,12 +450,11 @@ def process_overwhelmed(message, creds) -> str:
         print(f"Error fetching events: {e}")
         events = []
     
-    # Prepare context by appending event information and previous messages
     conversation_history = "\n".join(
         f"{msg['role']}: {msg['content']}" for msg in st.session_state.messages
     )
     context = (
-        "The user mentioned feeling overwhelmed. the user suffers from adhd and has trouble starting with tasks which has intertia. You can break down the tasks into smaller tasks of 20-30 mins each. Here are the upcoming events from your calendar: \n"
+        "The user mentioned feeling overwhelmed. the user suffers from executive functional difficulties and has trouble starting with tasks which has intertia. You can break down the tasks into smaller tasks of 20-30 mins each. Here are the upcoming events from your calendar: \n"
         f"{json.dumps(events, indent=2)}\n\n"
         "Previous conversation history:\n" + conversation_history + "\n\n"
         f"User message: {message}\n"
@@ -376,10 +501,19 @@ def process_with_gemma(message, creds) -> str:
     # Format todo list for context
     todo_list_context = "\n".join(f"- {todo}" for todo in todos)
 
+    # Get current time in PST
+    est = pytz.timezone('America/Toronto')
+    current_time = datetime.now(est)
+    time_str = current_time.strftime("%I:%M %p %Z")
+    today_str = current_time.strftime("%Y-%m-%d")
+    print(f"Current time: {time_str}, Today's date: {today_str}")
     # Compose prompt for Gemma
     context = (
         "You're a helpful calendar and task management assistant. "
-        "The user has ADHD and needs help breaking down tasks and managing their schedule.\n\n"
+        "The user has Executive functional difficulties and needs help breaking down tasks and managing their schedule.\n\n"
+        "IMPORTANT THINGS TO REMEBER:\n"
+        f"Current time in EST is  {time_str}\n"
+        f"Today's date is: {today_str}\n\n"
         f"Current Todo List:\n{todo_list_context}\n\n"
         f"Upcoming calendar events:\n{json.dumps(events, indent=2)}\n\n"
         "Recent conversation history:\n"
@@ -440,10 +574,41 @@ def authenticate():
     st.session_state.authenticated = True
     st.session_state.creds = creds
 
+def refresh_all():
+    """Refresh todos and calendar events"""
+    # Reload todos and save them to session state
+    try:
+        with open("todos.json", "r") as f:
+            todos = json.load(f)
+        st.session_state.todos = todos
+    except (FileNotFoundError, json.JSONDecodeError):
+        st.session_state.todos = []
+    
+    # Refresh calendar events
+    if st.session_state.creds:
+        # Get today's events for sidebar
+        toronto_tz = pytz.timezone('America/Toronto')
+        today_start = datetime.now(toronto_tz).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_end = today_start + timedelta(days=1)
+        
+        try:
+            events = get_events.invoke({
+                "startDateTime": today_start.isoformat(),
+                "endDateTime": today_end.isoformat()
+            })
+            st.session_state.today_events = events
+        except Exception as e:
+            print(f"Error refreshing events: {e}")
+            st.session_state.today_events = []
+    
+    # Force a rerun to update the UI
+    st.rerun()
 
 # Configure page settings with dark theme support
 st.set_page_config(
-    page_title="Calendar Assistant",
+    page_title="Agendly",
     page_icon="📅",
     layout="centered",
     initial_sidebar_state="expanded"
@@ -480,8 +645,57 @@ st.markdown("""
         50% { opacity: 0.5; }
         100% { opacity: 1; }
     }
+    .refresh-button {
+        width: 40px !important;
+        height: 40px !important;
+        border-radius: 50% !important;
+        background-color: #ff4b4b !important;
+        padding: 0px !important;
+        border: none !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }
+    
+    .refresh-button:hover {
+        background-color: #ff3333 !important;
+    }
+    
+    /* Make the button container flex */
+    .stButton {
+        display: inline-flex !important;
+        margin-right: 5px !important;
+    }
     </style>
 """, unsafe_allow_html=True)
+
+def extract_timer_duration(text):
+    """Extract minutes from timer command"""
+    pattern = r"start a timer for (\d+) minute?s?"
+    match = re.search(pattern, text.lower())
+    if match:
+        return int(match.group(1))
+    return None
+
+def start_timer(minutes):
+    """Start a timer for specified minutes"""
+    st.session_state.timer_duration = minutes
+    st.session_state.timer_end_time = datetime.now() + timedelta(minutes=minutes)
+
+def display_timer():
+    """Display timer in sidebar"""
+    if st.session_state.timer_end_time:
+        time_remaining = st.session_state.timer_end_time - datetime.now()
+        minutes_remaining = int(time_remaining.total_seconds() // 60)
+        seconds_remaining = int(time_remaining.total_seconds() % 60)
+        
+        if time_remaining.total_seconds() <= 0:
+            st.sidebar.success(f"⏰ {st.session_state.timer_duration} minute timer completed!")
+            # Clear the timer
+            st.session_state.timer_end_time = None
+            st.session_state.timer_duration = None
+        else:
+            st.sidebar.info(f"⏳ Timer: {minutes_remaining:02d}:{seconds_remaining:02d}")
 
 def main():
     try:
@@ -490,11 +704,11 @@ def main():
         st.error(f"Initialization error: {str(e)}")
         return
     
-    st.title("Executive Fuinction Assistant")
+    st.title("An Assistant for Executive Function Support")
     if not st.session_state.authenticated:
         st.markdown("""
             <div class="welcome-container">
-                <h2>👋 Welcome to Calendar Assistant!</h2>
+                <h2>👋 Welcome to Agendly</h2>
                 <p style="color: #666666; margin: 1rem 0;">Connect your Google Calendar to get started</p>
             </div>
         """, unsafe_allow_html=True)
@@ -544,13 +758,19 @@ def main():
             """,
         ):
             with st.sidebar:
+                st_autorefresh(interval=10000, key="sidebar_autorefresh")  # auto-refresh sidebar every 10s
+                # Display the timer at the top of the sidebar
+                display_timer()
+                
                 # Today's Events Section
                 st.markdown("### 📅 Today's Events")
                 if st.session_state.creds:
                     from event_handler import init_google_calendar
                     init_google_calendar(st.session_state.creds)
                     
-                    today_start = datetime.now(timezone.utc).replace(
+                    # Use Toronto timezone consistently
+                    toronto_tz = pytz.timezone('America/Toronto')
+                    today_start = datetime.now(toronto_tz).replace(
                         hour=0, minute=0, second=0, microsecond=0
                     )
                     today_end = today_start + timedelta(days=1)
@@ -561,38 +781,50 @@ def main():
                             "endDateTime": today_end.isoformat()
                         })
                         
-                        # Directly use the events list if it's already in the expected format
+                        # Simplified event response parsing
+                        events = []
                         if isinstance(events_response, list):
                             events = events_response
                         elif isinstance(events_response, dict):
-                            # Handle the dictionary case as before
-                            if 'data' in events_response and 'items' in events_response['data']:
-                                events = events_response['data']['items']
-                            elif 'items' in events_response:
+                            # Get items from any level of nesting
+                            if 'items' in events_response:
                                 events = events_response['items']
-                            else:
-                                events = []
-                        else:
-                            events = []
+                            elif 'data' in events_response and 'items' in events_response['data']:
+                                events = events_response['data']['items']
+                            elif 'data' in events_response:
+                                events = events_response['data']
                         
                         if events:
-                            for event in events:
-                                col1, col2 = st.columns([8, 2])
+                            # Sort events by start time
+                            events.sort(key=lambda x: x.get('start', {}).get('dateTime', ''))
+                            
+                            for index, event in enumerate(events):
+                                col1, col2, col3 = st.columns([6, 2, 2])
                                 with col1:
-                                    # Extract start and end times from the event
                                     start = event.get('start', {}).get('dateTime')
                                     end = event.get('end', {}).get('dateTime')
                                     
                                     if start and end:
-                                        start_time = datetime.fromisoformat(start).strftime("%I:%M %p")
-                                        end_time = datetime.fromisoformat(end).strftime("%I:%M %p")
+                                        # Convert to Toronto timezone for display
+                                        start_dt = datetime.fromisoformat(start).astimezone(toronto_tz)
+                                        end_dt = datetime.fromisoformat(end).astimezone(toronto_tz)
+                                        duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+                                        start_time = start_dt.strftime("%I:%M %p")
+                                        end_time = end_dt.strftime("%I:%M %p")
                                         
                                         st.markdown(
                                             f"**{event.get('summary', 'Untitled Event')}**\n"
                                             f"🕒 {start_time} - {end_time}"
                                         )
                                 with col2:
-                                    if st.button("❌", key=f"delete_event_{event.get('eventId')}"):
+                                    if st.button("⏲️", 
+                                                key=f"timer_{event.get('id', '')}_{index}", 
+                                                help=f"Start {duration_minutes} min timer"):
+                                        start_timer(duration_minutes)
+                                        st.rerun()
+                                with col3:
+                                    if st.button("❌", 
+                                                key=f"delete_event_{event.get('eventId', '')}_{index}"):
                                         try:
                                             delete_event.invoke({"eventId": event.get('eventId')})
                                             st.success("Event deleted!")
@@ -679,26 +911,36 @@ def main():
                                 print(f"Scheduling error details: {e}")
             col1, col2 = st.columns([1, 10])
             with col1:
-                if st.button(icon=st.session_state.recording_icon, label="", key="mic", type='primary'):
-                    if not st.session_state.recording:
-                        # Start recording
-                        st.session_state.recording = True
-                        st.session_state.recording_icon = ":material/stop_circle:"
-                        st.session_state.audio_recorder = AudioRecorder()
-                        st.session_state.audio_recorder.start_recording()
-                        st.rerun()
-                    else:
-                        # Stop recording
-                        audio_file = st.session_state.audio_recorder.stop_recording()
-                        st.session_state.recording = False
-                        st.session_state.recording_icon = ":material/mic:"
-                        if audio_file:
-                            with st.spinner("Transcribing..."):
-                                transcription = transcribe_audio(audio_file)
-                                print(transcription)
-                                st.session_state.transcribed_text = transcription
-                                os.unlink(audio_file)  # Clean up temporary file
+                # Create a horizontal container for the buttons
+                button_cols = st.columns([1, 1])
+                
+                # Mic button in first column
+                with button_cols[0]:
+                    if st.button(icon=st.session_state.recording_icon, label="", key="mic", type='primary'):
+                        if not st.session_state.recording:
+                            # Start recording
+                            st.session_state.recording = True
+                            st.session_state.recording_icon = ":material/stop_circle:"
+                            st.session_state.audio_recorder = AudioRecorder()
+                            st.session_state.audio_recorder.start_recording()
                             st.rerun()
+                        else:
+                            # Stop recording
+                            audio_file = st.session_state.audio_recorder.stop_recording()
+                            st.session_state.recording = False
+                            st.session_state.recording_icon = ":material/mic:"
+                            if audio_file:
+                                with st.spinner("Transcribing..."):
+                                    transcription = transcribe_audio(audio_file)
+                                    print(transcription)
+                                    st.session_state.transcribed_text = transcription
+                                    os.unlink(audio_file)  # Clean up temporary file
+                                st.rerun()
+                
+                # Refresh button in second column
+                with button_cols[1]:
+                    if st.button("🔄", key="refresh", help="Refresh todos and events", type="primary", use_container_width=True):
+                        refresh_all()
             with col2:
                 user_input = st.chat_input("Ask about your calendar...")       
             
@@ -721,43 +963,62 @@ def main():
             # If already using Gemma for conversation, continue with Gemma.
             if st.session_state.using_gemma:
                 with st.chat_message("assistant"):
-                    response = process_with_gemma(text, st.session_state.creds)
-                    if audio:
-                        speak_text(response)
-                    st.markdown(response)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": response
-                    })
+                    with st.spinner("Thinking..."):
+                        try:
+                            response = process_with_gemma(text, st.session_state.creds)
+                            if response:
+                                st.markdown(response)
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": response
+                                })
+                                # Speak the response if audio input was used
+                                if audio    :
+                                    with st.spinner("Generating speech..."):
+                                        speak_text(response)
+                            else:
+                                st.error("No response received from Gemma")
+                                st.session_state.using_gemma = False
+                        except Exception as e:
+                            print(f"Error with Gemma response: {e}")
+                            st.error("Failed to get response from Gemma")
+                            st.session_state.using_gemma = False
             else:
-                # Check if the user message contains "overwhelmed"
-                if re.search(r"\boverwhelmed\b", text, re.IGNORECASE):
-                    with st.chat_message("assistant"):
-                        response = process_overwhelmed(text, st.session_state.creds)
-                        # Set flag to continue conversation with Gemma
-                        st.session_state.using_gemma = True
-                        if audio:
-                            speak_text(response)
-                        st.markdown(response)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": response
-                        })
-                else:
+                
                     # Process normally using the default chatbot workflow
                     with st.chat_message("assistant"):
-                        response = json.loads(process_message(
-                            text, 
-                            st.session_state.creds,
-                            energy_level=energy_level  # Pass the energy level
-                        ))['response_for_user']
-                        if audio:
-                            speak_text(response)
-                        st.markdown(response)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": response
-                        })
+                        with st.spinner("Processing..."):
+                            raw_response = process_message(
+                                text, 
+                                st.session_state.creds,
+                                energy_level=energy_level
+                            )
+                            try:
+                                # Parse the JSON response
+                                response_data = json.loads(raw_response)
+                                response_for_user = response_data.get("response_for_user", "I'm sorry, I couldn't process your request.")
+                                
+                                # Display only the 'response_for_user' field
+                                st.markdown(response_for_user)
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": response_for_user
+                                })
+                                
+                                # Speak the response if audio input was used
+                                if audio:
+                                    with st.spinner("Generating speech..."):
+                                        speak_text(response_for_user)
+                                        
+                            except json.JSONDecodeError as e:
+                                st.error("Failed to process response")
+                                print(f"JSON parsing error: {e}")
+            # After processing the message and getting a response
+            # if response and 'edit_todo' in str(response):  # If todo was edited
+            #     # Reload todos into session state
+            #     st.session_state.todos = load_todos()
+            #     st.rerun()
 
 if __name__ == "__main__":
+    import time
     main()
